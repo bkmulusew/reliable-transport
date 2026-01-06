@@ -3,6 +3,8 @@ from lossy_socket import LossyUDP
 # do not import anything else from socket except INADDR_ANY
 from socket import INADDR_ANY
 import struct
+from concurrent.futures import ThreadPoolExecutor
+import threading
 
 MAX_UDP_PAYLOAD = 1472
 HEADER_FMT = "!HHH"          # msg_id, seq, total
@@ -26,6 +28,58 @@ class Streamer:
         self._inflight = {}   # msg_id -> {"total": int, "chunks": {seq: bytes}}
         self._complete = {}   # msg_id -> bytes
 
+        # Thread coordination
+        self._lock = threading.Lock()
+        self._cv = threading.Condition(self._lock)
+        self._closed = False
+
+        # IMPORTANT: keep executor as an attribute (don’t let it get GC’d)
+        self._executor = ThreadPoolExecutor(max_workers=1)
+        self._listener_future = self._executor.submit(self._listener)
+
+    def _listener(self) -> None:
+        """Background thread: receive packets forever and assemble messages."""
+        while True:
+            packet, addr = self.socket.recvfrom()   # LossyUDP blocks but wakes every ~1s
+
+            # LossyUDP returns b'' when stoprecv() was called
+            if packet == b"":
+                return
+
+            # Parse/assemble under lock, then notify waiters when something completes
+            if len(packet) < HEADER_SIZE:
+                continue
+
+            msg_id, seq, total = struct.unpack(HEADER_FMT, packet[:HEADER_SIZE])
+            payload = packet[HEADER_SIZE:]
+
+            with self._cv:
+                if self._closed:
+                    return
+
+                st = self._inflight.get(msg_id)
+                if st is None:
+                    st = {"total": total, "chunks": {}}
+                    self._inflight[msg_id] = st
+                else:
+                    if st["total"] != total:
+                        continue
+
+                if seq >= total:
+                    continue
+
+                # store if new
+                if seq not in st["chunks"]:
+                    st["chunks"][seq] = payload
+
+                if len(st["chunks"]) == st["total"]:
+                    assembled = b"".join(st["chunks"][i] for i in range(st["total"]))
+                    self._complete[msg_id] = assembled
+                    del self._inflight[msg_id]
+
+                    # Wake recv() in case it’s waiting for this (or future) msg
+                    self._cv.notify_all()
+
     def send(self, data_bytes: bytes) -> None:
         """Note that data_bytes can be larger than one packet."""
         msg_id = self._next_msg_id & 0xFFFF
@@ -40,53 +94,33 @@ class Streamer:
             self.socket.sendto(header + chunk, (self.dst_ip, self.dst_port))
 
     def recv(self) -> bytes:
-        """Blocks until the next in-order message (by send-call) is ready."""
-        # If we already have the next message fully assembled, return it immediately
-        if self._expected_msg_id in self._complete:
-            data = self._complete.pop(self._expected_msg_id)
-            self._expected_msg_id = (self._expected_msg_id + 1) & 0xFFFF
-            return data
+        with self._cv:
+            while True:
+                if self._closed:
+                    raise RuntimeError("Streamer is closed")
 
-        while True:
-            packet, addr = self.socket.recvfrom()
-
-            # Basic sanity: must at least contain header
-            if len(packet) < HEADER_SIZE:
-                continue
-
-            msg_id, seq, total = struct.unpack(HEADER_FMT, packet[:HEADER_SIZE])
-            payload = packet[HEADER_SIZE:]
-
-            # Create inflight entry if first time seeing this msg_id
-            st = self._inflight.get(msg_id)
-            if st is None:
-                st = {"total": total, "chunks": {}}
-                self._inflight[msg_id] = st
-            else:
-                # Sanity: ignore inconsistent 'total' for same msg_id
-                if st["total"] != total:
-                    continue
-
-            if seq >= total:
-                continue
-
-            # Store chunk if new (ignore duplicates)
-            st["chunks"].setdefault(seq, payload)
-
-            # If this message is now complete, assemble and stash it
-            if len(st["chunks"]) == st["total"]:
-                assembled = b"".join(st["chunks"][i] for i in range(st["total"]))
-                self._complete[msg_id] = assembled
-                del self._inflight[msg_id]
-
-                # If it’s the next expected message, return it now
-                if msg_id == self._expected_msg_id:
+                if self._expected_msg_id in self._complete:
                     data = self._complete.pop(self._expected_msg_id)
                     self._expected_msg_id = (self._expected_msg_id + 1) & 0xFFFF
                     return data
 
+                self._cv.wait()
+
     def close(self) -> None:
         """Cleans up. It should block (wait) until the Streamer is done with all
            the necessary ACKs and retransmissions"""
-        # your code goes here, especially after you add ACKs and retransmissions.
-        pass
+        # Tell LossyUDP.recvfrom() to stop (it will return b'')
+        self.socket.stoprecv()
+
+        # Mark closed + wake any waiting recv()
+        with self._cv:
+            self._closed = True
+            self._cv.notify_all()
+
+        # Wait for listener to exit and clean up executor
+        try:
+            self._listener_future.result(timeout=2)
+        except Exception:
+            pass
+
+        self._executor.shutdown(wait=True)
