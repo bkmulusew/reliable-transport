@@ -6,8 +6,10 @@ import struct
 from concurrent.futures import ThreadPoolExecutor
 import threading
 
+FLAG_DATA = 0
+FLAG_ACK = 1
 MAX_UDP_PAYLOAD = 1472
-HEADER_FMT = "!HHH"          # msg_id, seq, total
+HEADER_FMT = "!BHHH"      # flag, msg_id, seq, total
 HEADER_SIZE = struct.calcsize(HEADER_FMT)
 MAX_DATA_SIZE = MAX_UDP_PAYLOAD - HEADER_SIZE
 
@@ -27,6 +29,9 @@ class Streamer:
         self._expected_msg_id = 0
         self._inflight = {}   # msg_id -> {"total": int, "chunks": {seq: bytes}}
         self._complete = {}   # msg_id -> bytes
+
+        # ACK tracking (for stop-and-wait)
+        self._acked = set()   # set of msg_ids that have been ACKed
 
         # Thread coordination
         self._lock = threading.Lock()
@@ -50,9 +55,21 @@ class Streamer:
             if len(packet) < HEADER_SIZE:
                 continue
 
-            msg_id, seq, total = struct.unpack(HEADER_FMT, packet[:HEADER_SIZE])
+            flag, msg_id, seq, total = struct.unpack(HEADER_FMT, packet[:HEADER_SIZE])
+
+            # Handle ACKs: record them and wake any waiting send()
+            if flag == FLAG_ACK:
+                with self._cv:
+                    if self._closed:
+                        return
+                    self._acked.add(msg_id)
+                    self._cv.notify_all()
+                continue
+
+            # DATA packet
             payload = packet[HEADER_SIZE:]
 
+            send_ack = False  # whether to send ACK after we finish assembling
             with self._cv:
                 if self._closed:
                     return
@@ -80,6 +97,15 @@ class Streamer:
                     # Wake recv() in case it’s waiting for this (or future) msg
                     self._cv.notify_all()
 
+                    # Mark that we should send an ACK for this msg_id
+                    send_ack = True
+
+            # Send ACK outside the lock
+            if send_ack:
+                ack_header = struct.pack(HEADER_FMT, FLAG_ACK, msg_id, 0, 0)
+                # No payload for ACK
+                self.socket.sendto(ack_header, addr)
+
     def send(self, data_bytes: bytes) -> None:
         """Note that data_bytes can be larger than one packet."""
         msg_id = self._next_msg_id & 0xFFFF
@@ -87,11 +113,21 @@ class Streamer:
 
         total = (len(data_bytes) + MAX_DATA_SIZE - 1) // MAX_DATA_SIZE
 
+        # Send all chunks for this message
         for seq in range(total):
             start = seq * MAX_DATA_SIZE
             chunk = data_bytes[start:start + MAX_DATA_SIZE]
-            header = struct.pack(HEADER_FMT, msg_id, seq, total)
+            header = struct.pack(HEADER_FMT, FLAG_DATA, msg_id, seq, total)
             self.socket.sendto(header + chunk, (self.dst_ip, self.dst_port))
+
+        # Now wait for ACK for this msg_id (stop-and-wait, no timeout)
+        with self._cv:
+            while msg_id not in self._acked:
+                if self._closed:
+                    raise RuntimeError("Streamer is closed")
+                self._cv.wait()
+            # consume the ACK entry
+            self._acked.remove(msg_id)
 
     def recv(self) -> bytes:
         with self._cv:
