@@ -6,17 +6,40 @@ import struct
 from concurrent.futures import ThreadPoolExecutor
 import threading
 import time
+import hashlib
 
 FLAG_DATA = 0
 FLAG_ACK = 1
 FLAG_FIN = 2
 
 MAX_UDP_PAYLOAD = 1472
-HEADER_FMT = "!BHHH"      # flag, msg_id, seq, total
+
+# Header: flag, msg_id, seq, total
+HEADER_FMT = "!BHHH"
 HEADER_SIZE = struct.calcsize(HEADER_FMT)
-MAX_DATA_SIZE = MAX_UDP_PAYLOAD - HEADER_SIZE
+
+# MD5 hash size in bytes
+HASH_SIZE = 16
+
+# Maximum data per packet so that header + hash + payload <= MAX_UDP_PAYLOAD
+MAX_DATA_SIZE = MAX_UDP_PAYLOAD - HEADER_SIZE - HASH_SIZE
 
 ACK_TIMEOUT = 0.25  # seconds
+
+def _build_packet(flag: int, msg_id: int, seq: int, total: int, payload: bytes) -> bytes:
+    """
+    Build a packet:
+    [HEADER (flag,msg_id,seq,total)] [MD5(header+payload)] [payload]
+    Ensures the final packet size does not exceed MAX_UDP_PAYLOAD.
+    """
+    header = struct.pack(HEADER_FMT, flag, msg_id, seq, total)
+    digest = hashlib.md5(header + payload).digest()  # 16 bytes
+    packet = header + digest + payload
+
+    if len(packet) > MAX_UDP_PAYLOAD:
+        raise ValueError("Packet larger than MAX_UDP_PAYLOAD")
+
+    return packet
 
 class Streamer:
     def __init__(self, dst_ip, dst_port,
@@ -59,10 +82,32 @@ class Streamer:
             if packet == b"":
                 return
 
-            if len(packet) < HEADER_SIZE:
+            if len(packet) < HEADER_SIZE + HASH_SIZE:
                 continue
 
-            flag, msg_id, seq, total = struct.unpack(HEADER_FMT, packet[:HEADER_SIZE])
+            # Parse header
+            try:
+                flag, msg_id, seq, total = struct.unpack(
+                    HEADER_FMT, packet[:HEADER_SIZE]
+                )
+            except struct.error:
+                continue
+
+            # Extract digest and payload
+            digest = packet[HEADER_SIZE:HEADER_SIZE + HASH_SIZE]
+            payload = packet[HEADER_SIZE + HASH_SIZE:]
+
+            # Verify MD5(header + payload)
+            header = packet[:HEADER_SIZE]
+            expected_digest = hashlib.md5(header + payload).digest()
+            if digest != expected_digest:
+                # Corrupted packet, drop
+                continue
+
+            # Safety: ensure payload isn't larger than we expect
+            if len(payload) > MAX_DATA_SIZE:
+                # Misbehaving peer or corruption; drop
+                continue
 
             # Handle ACKs (for DATA and FIN packets)
             if flag == FLAG_ACK:
@@ -85,13 +130,11 @@ class Streamer:
 
                 # Always ACK a FIN (could be retransmitted)
                 # Use seq=0 for FIN ACKs
-                ack_header = struct.pack(HEADER_FMT, FLAG_ACK, msg_id, 0, 0)
-                self.socket.sendto(ack_header, addr)
+                ack_packet = _build_packet(FLAG_ACK, msg_id, 0, 0, b"")
+                self.socket.sendto(ack_packet, addr)
                 continue
 
             # Otherwise, it’s a DATA packet
-            payload = packet[HEADER_SIZE:]
-
             with self._cv:
                 if self._closed:
                     return
@@ -123,9 +166,8 @@ class Streamer:
                     self._cv.notify_all()
 
             # Send ACK for this specific (msg_id, seq) outside the lock.
-            # total is included but not strictly needed by sender.
-            ack_header = struct.pack(HEADER_FMT, FLAG_ACK, msg_id, seq, total)
-            self.socket.sendto(ack_header, addr)
+            ack_packet = _build_packet(FLAG_ACK, msg_id, seq, total, b"")
+            self.socket.sendto(ack_packet, addr)
 
     def send(self, data_bytes: bytes) -> None:
         """Note that data_bytes can be larger than one packet."""
@@ -142,8 +184,9 @@ class Streamer:
         for seq in range(total):
             start = seq * MAX_DATA_SIZE
             chunk = data_bytes[start:start + MAX_DATA_SIZE]
-            header = struct.pack(HEADER_FMT, FLAG_DATA, msg_id, seq, total)
-            packet = header + chunk
+
+            # Build packet with MD5 checksum and size safety
+            packet = _build_packet(FLAG_DATA, msg_id, seq, total, chunk)
             packets.append(packet)
             self.socket.sendto(packet, (self.dst_ip, self.dst_port))
 
@@ -213,8 +256,7 @@ class Streamer:
         fin_msg_id = self._next_msg_id & 0xFFFF
         self._next_msg_id = (self._next_msg_id + 1) & 0xFFFF
 
-        fin_header = struct.pack(HEADER_FMT, FLAG_FIN, fin_msg_id, 0, 0)
-        fin_packet = fin_header  # no payload
+        fin_packet = _build_packet(FLAG_FIN, fin_msg_id, 0, 0, b"")
 
         # Step 2 & 3: send FIN and wait for ACK with retransmission
         while True:
