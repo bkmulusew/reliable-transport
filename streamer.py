@@ -35,8 +35,8 @@ class Streamer:
         self._inflight = {}   # msg_id -> {"total": int, "chunks": {seq: bytes}}
         self._complete = {}   # msg_id -> bytes
 
-        # ACK tracking (for stop-and-wait)
-        self._acked = set()   # set of msg_ids that have been ACKed
+        # ACK tracking: set of (msg_id, seq) tuples that have been ACKed
+        self._acked_packets = set()
 
         # FIN tracking
         self._fin_received = False  # True once we’ve seen a FIN from the peer
@@ -64,12 +64,13 @@ class Streamer:
 
             flag, msg_id, seq, total = struct.unpack(HEADER_FMT, packet[:HEADER_SIZE])
 
-            # Handle ACKs
+            # Handle ACKs (for DATA and FIN packets)
             if flag == FLAG_ACK:
                 with self._cv:
                     if self._closed:
                         return
-                    self._acked.add(msg_id)
+                    # Record that this (msg_id, seq) was ACKed
+                    self._acked_packets.add((msg_id, seq))
                     self._cv.notify_all()
                 continue
 
@@ -83,6 +84,7 @@ class Streamer:
                     self._cv.notify_all()
 
                 # Always ACK a FIN (could be retransmitted)
+                # Use seq=0 for FIN ACKs
                 ack_header = struct.pack(HEADER_FMT, FLAG_ACK, msg_id, 0, 0)
                 self.socket.sendto(ack_header, addr)
                 continue
@@ -90,7 +92,6 @@ class Streamer:
             # Otherwise, it’s a DATA packet
             payload = packet[HEADER_SIZE:]
 
-            send_ack = False  # whether to send ACK after we finish assembling
             with self._cv:
                 if self._closed:
                     return
@@ -105,12 +106,14 @@ class Streamer:
                         continue
 
                 if seq >= total:
+                    # Invalid seq index
                     continue
 
-                # store if new
+                # Store chunk if new
                 if seq not in st["chunks"]:
                     st["chunks"][seq] = payload
 
+                # If we now have a full message, assemble and mark complete
                 if len(st["chunks"]) == st["total"]:
                     assembled = b"".join(st["chunks"][i] for i in range(st["total"]))
                     self._complete[msg_id] = assembled
@@ -119,14 +122,10 @@ class Streamer:
                     # Wake recv() in case it’s waiting for this (or future) msg
                     self._cv.notify_all()
 
-                    # Mark that we should send an ACK for this msg_id
-                    send_ack = True
-
-            # Send ACK outside the lock
-            if send_ack:
-                ack_header = struct.pack(HEADER_FMT, FLAG_ACK, msg_id, 0, 0)
-                # No payload for ACK
-                self.socket.sendto(ack_header, addr)
+            # Send ACK for this specific (msg_id, seq) outside the lock.
+            # total is included but not strictly needed by sender.
+            ack_header = struct.pack(HEADER_FMT, FLAG_ACK, msg_id, seq, total)
+            self.socket.sendto(ack_header, addr)
 
     def send(self, data_bytes: bytes) -> None:
         """Note that data_bytes can be larger than one packet."""
@@ -134,6 +133,9 @@ class Streamer:
         self._next_msg_id = (self._next_msg_id + 1) & 0xFFFF
 
         total = (len(data_bytes) + MAX_DATA_SIZE - 1) // MAX_DATA_SIZE
+        if total == 0:
+            # Nothing to send
+            return
 
         # Build all packets so we can retransmit them on timeout
         packets = []
@@ -145,30 +147,38 @@ class Streamer:
             packets.append(packet)
             self.socket.sendto(packet, (self.dst_ip, self.dst_port))
 
-        # Stop-and-wait with retransmission on timeout
-        while True:
+        pending_seqs = set(range(total))
+
+        # Retransmit only packets whose (msg_id, seq) haven't been ACKed
+        while pending_seqs:
             with self._cv:
                 if self._closed:
                     raise RuntimeError("Streamer is closed")
 
-                if msg_id in self._acked:
-                    # consume the ACK entry and return
-                    self._acked.remove(msg_id)
+                # Remove any sequences that have been ACKed
+                newly_acked = {
+                    seq for seq in pending_seqs
+                    if (msg_id, seq) in self._acked_packets
+                }
+                for seq in newly_acked:
+                    pending_seqs.remove(seq)
+                    self._acked_packets.remove((msg_id, seq))
+
+                if not pending_seqs:
+                    # All packets for this message were ACKed
                     return
 
-                # Wait up to ACK_TIMEOUT for an ACK
+                # Wait up to ACK_TIMEOUT for more ACKs
                 self._cv.wait(timeout=ACK_TIMEOUT)
-
-                if msg_id in self._acked:
-                    self._acked.remove(msg_id)
-                    return
 
                 if self._closed:
                     raise RuntimeError("Streamer is closed")
 
-            # If we reach here, we timed out without an ACK: retransmit all packets
-            for packet in packets:
-                self.socket.sendto(packet, (self.dst_ip, self.dst_port))
+                # Loop; on timeout we fall through and retransmit remaining
+
+            # Timeout or spurious wakeup: retransmit only unacked packets
+            for seq in pending_seqs:
+                self.socket.sendto(packets[seq], (self.dst_ip, self.dst_port))
 
     def recv(self) -> bytes:
         with self._cv:
@@ -215,14 +225,15 @@ class Streamer:
                 if self._closed:
                     break
 
-                if fin_msg_id in self._acked:
-                    self._acked.remove(fin_msg_id)
+                # FIN is considered ACKed when (fin_msg_id, 0) is ACKed
+                if (fin_msg_id, 0) in self._acked_packets:
+                    self._acked_packets.remove((fin_msg_id, 0))
                     break
 
                 self._cv.wait(timeout=ACK_TIMEOUT)
 
-                if fin_msg_id in self._acked:
-                    self._acked.remove(fin_msg_id)
+                if (fin_msg_id, 0) in self._acked_packets:
+                    self._acked_packets.remove((fin_msg_id, 0))
                     break
 
                 if self._closed:
