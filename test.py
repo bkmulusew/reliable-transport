@@ -1,9 +1,9 @@
 from streamer import Streamer
 import sys
 import lossy_socket
+import time
 
 NUMS=1000
-
 
 def receive(s):
     expected = 0
@@ -29,15 +29,17 @@ def receive(s):
                 str_buf = t
                 break
 
-    
 def host1(listen_port, remote_port):
+    start_receive = time.time()
     s = Streamer(dst_ip="localhost", dst_port=remote_port,
                  src_ip="localhost", src_port=listen_port)
     receive(s)
+    end_receive = time.time()
     print("STAGE 1 TEST PASSED!")
     # send large chunks of data
     i = 0
     buf = ""
+    start_send = time.time()
     while i < NUMS:
         buf += ("%d " % i)
         if len(buf) > 12345 or i == NUMS-1:
@@ -46,10 +48,14 @@ def host1(listen_port, remote_port):
             buf = ""
         i += 1
     s.close()
+    end_send = time.time()
+    print(f"[HOST1] Total receive time: {end_receive - start_receive:.3f} seconds")
+    print(f"[HOST1] Total send time: {end_send - start_send:.3f} seconds")
+    print(f"[HOST1] Total time: {end_send - start_receive:.3f} seconds")
     print("CHECK THE OTHER SCRIPT FOR STAGE 2 RESULTS.")
 
-        
 def host2(listen_port, remote_port):
+    start_send = time.time()
     s = Streamer(dst_ip="localhost", dst_port=remote_port,
                  src_ip="localhost", src_port=listen_port)
     # send small pieces of data
@@ -57,10 +63,15 @@ def host2(listen_port, remote_port):
         buf = ("%d " % i)
         print("sending {%s}" % buf)
         s.send(buf.encode('utf-8'))
+    end_send = time.time()
+    start_receive = time.time()
     receive(s)
     s.close()
+    end_receive = time.time()
+    print(f"[HOST2] Total send time: {end_send - start_send:.3f} seconds")
+    print(f"[HOST2] Total receive time: {end_receive - start_receive:.3f} seconds")
+    print(f"[HOST2] Total time: {end_receive - start_send:.3f} seconds")
     print("STAGE 2 TEST PASSED!")
-
 
 def main():
     lossy_socket.sim = lossy_socket.SimulationParams(loss_rate=0.1, corruption_rate=0.1,
@@ -80,7 +91,6 @@ def main():
         host2(port2, port1)
     else:
         print("Unexpected last argument: " + sys.argv[2])
-
 
 if __name__ == "__main__":
     main()

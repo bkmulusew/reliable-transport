@@ -26,6 +26,9 @@ MAX_DATA_SIZE = MAX_UDP_PAYLOAD - HEADER_SIZE - HASH_SIZE
 
 ACK_TIMEOUT = 0.25  # seconds
 
+# Go-Back-N window size (max unacked DATA packets in flight)
+WINDOW_SIZE = 100
+
 def _build_packet(flag: int, msg_id: int, seq: int, total: int, payload: bytes) -> bytes:
     """
     Build a packet:
@@ -54,28 +57,77 @@ class Streamer:
         self._next_msg_id = 0  # increments per send()
 
         # Receiver state
-        self._expected_msg_id = 0
-        self._inflight = {}   # msg_id -> {"total": int, "chunks": {seq: bytes}}
-        self._complete = {}   # msg_id -> bytes
-
-        # ACK tracking: set of (msg_id, seq) tuples that have been ACKed
-        self._acked_packets = set()
+        # msg_id -> {"total": int, "chunks": {seq: bytes}, "expected": int}
+        # "expected" is the next in-order seq number we want (GBN-style).
+        self._inflight_msg = {}
+        self._complete_msg = {}   # msg_id -> bytes
+        self._expected_msg_id = 0  # for recv() ordering of whole messages
 
         # FIN tracking
         self._fin_received = False  # True once we’ve seen a FIN from the peer
+
+        # FIN ACK tracking
+        self._fin_acks_received = False
 
         # Thread coordination
         self._lock = threading.Lock()
         self._cv = threading.Condition(self._lock)
         self._closed = False
 
-        # IMPORTANT: keep executor as an attribute (don’t let it get GC’d)
-        self._executor = ThreadPoolExecutor(max_workers=1)
+        # Executor (listener + global sender loop)
+        self._executor = ThreadPoolExecutor(max_workers=2)
+
+        # --- Go-Back-N global state across ALL messages ---
+
+        # (msg_id, seq) -> packet bytes for any unacked DATA packet
+        self._outstanding = {}
+
+        # Send order of packets (list of (msg_id, seq) in the order first sent)
+        self._resend_queue = []
+
+        # Per-message pending seqs: msg_id -> set of unacked seq indices
+        self._pending_by_msg = {}
+
+        # Explicit base tracking & timer restart on base advance
+        # Current GBN base packet key (msg_id, seq), or None if none outstanding
+        self._base_key = None
+        # Time when the base last changed (used by retransmission timer)
+        self._last_base_change_time = 0.0
+
+        # Background threads
         self._listener_future = self._executor.submit(self._listener)
+        self._sender_future = self._executor.submit(self._sender_loop)
+
+    # ---------- Helper for base recomputation (GBN) ----------
+
+    def _recompute_base_locked(self) -> None:
+        """
+        Recompute the GBN base (earliest unacked packet in send_order)
+        and prune fully-ACKed prefixes from _resend_queue.
+
+        Must be called WITH self._cv held.
+        """
+        # Drop any leading entries that are no longer outstanding.
+        # This keeps _resend_queue roughly bounded by the current window size.
+        while self._resend_queue and self._resend_queue[0] not in self._outstanding:
+            self._resend_queue.pop(0)
+
+        if self._resend_queue:
+            new_base = self._resend_queue[0]
+        else:
+            new_base = None
+
+        if new_base != self._base_key:
+            self._base_key = new_base
+            # Restart timer only when the base advances or becomes None
+            self._last_base_change_time = time.time()
+
+    # ---------- Listener Thread ----------
 
     def _listener(self) -> None:
         """Background thread: receive packets forever and assemble messages."""
         while True:
+            # TODO: wrap your listening in a try/catch statement. Might cause exceptions
             packet, addr = self.socket.recvfrom()   # LossyUDP blocks but wakes every ~1s
 
             # LossyUDP returns b'' when stoprecv() was called
@@ -83,6 +135,8 @@ class Streamer:
                 return
 
             if len(packet) < HEADER_SIZE + HASH_SIZE:
+                # Corrupted packet, drop
+                print("Corrupted packet, dropping")
                 continue
 
             # Parse header
@@ -91,6 +145,7 @@ class Streamer:
                     HEADER_FMT, packet[:HEADER_SIZE]
                 )
             except struct.error:
+                print("Error unpacking header")
                 continue
 
             # Extract digest and payload
@@ -102,24 +157,52 @@ class Streamer:
             expected_digest = hashlib.md5(header + payload).digest()
             if digest != expected_digest:
                 # Corrupted packet, drop
+                print("Corrupted packet, dropping")
                 continue
 
             # Safety: ensure payload isn't larger than we expect
             if len(payload) > MAX_DATA_SIZE:
                 # Misbehaving peer or corruption; drop
+                print("Corrupted packet, dropping")
                 continue
 
-            # Handle ACKs (for DATA and FIN packets)
+            # ---------- ACK packets ----------
             if flag == FLAG_ACK:
                 with self._cv:
                     if self._closed:
                         return
-                    # Record that this (msg_id, seq) was ACKed
-                    self._acked_packets.add((msg_id, seq))
+
+                    # Track all ACKed (msg_id, seq) pairs (used for FIN)
+                    if total == 0:  # FIN or FIN-ACK
+                        self._fin_acks_received = True
+
+                    # Only process DATA cumulative ACKs when total > 0 and seq in bounds
+                    if total > 0 and 0 <= seq < total:
+                        # pending may be None if all packets for this msg_id
+                        # have already been ACKed and we deleted the entry,
+                        # so late/duplicate ACKs are simply ignored.
+                        pending = self._pending_by_msg.get(msg_id)
+                        if pending is not None:
+                            # Cumulative ACK: all 0..seq are considered received
+                            to_remove = [s for s in pending if s <= seq]
+                            for s in to_remove:
+                                pending.remove(s)
+                                key = (msg_id, s)
+                                if key in self._outstanding:
+                                    del self._outstanding[key]
+
+                            if not pending:
+                                del self._pending_by_msg[msg_id]
+
+                            # Recompute base whenever outstanding changes
+                            self._recompute_base_locked()
+
+                    # Wake up sender loop / close() / send() if needed
                     self._cv.notify_all()
+
                 continue
 
-            # Handle FIN packets
+            # ---------- FIN packets ----------
             if flag == FLAG_FIN:
                 with self._cv:
                     if self._closed:
@@ -129,48 +212,128 @@ class Streamer:
                     self._cv.notify_all()
 
                 # Always ACK a FIN (could be retransmitted)
-                # Use seq=0 for FIN ACKs
+                # Use seq=0, total=0 for FIN ACKs
                 ack_packet = _build_packet(FLAG_ACK, msg_id, 0, 0, b"")
                 self.socket.sendto(ack_packet, addr)
                 continue
 
-            # Otherwise, it’s a DATA packet
+            # ---------- DATA packets (GBN-style receiver) ----------
             with self._cv:
                 if self._closed:
                     return
 
-                st = self._inflight.get(msg_id)
+                st = self._inflight_msg.get(msg_id)
                 if st is None:
-                    st = {"total": total, "chunks": {}}
-                    self._inflight[msg_id] = st
+                    # First time we see this msg_id
+                    st = {"total": total, "chunks": {}, "expected": 0}
+                    self._inflight_msg[msg_id] = st
                 else:
                     if st["total"] != total:
                         # Inconsistent header, drop
                         continue
 
-                if seq >= total:
-                    # Invalid seq index
+                expected = st["expected"]
+
+                # Decide whether to send an ACK and what seq to ACK
+                send_ack = False
+                ack_seq = None
+
+                if seq == expected:
+                    # In-order packet: accept and store
+                    st["chunks"][seq] = payload
+                    st["expected"] = expected + 1
+
+                    # If we now have the full message, assemble and mark complete
+                    if st["expected"] == st["total"]:
+                        assembled = b"".join(
+                            st["chunks"][i] for i in range(st["total"])
+                        )
+                        self._complete_msg[msg_id] = assembled
+                        del self._inflight_msg[msg_id]
+                        # Wake recv() in case it’s waiting
+                        self._cv.notify_all()
+
+                    # Highest in-order seq for this msg_id is now seq
+                    send_ack = True
+                    ack_seq = seq
+
+                elif seq < expected:
+                    # Duplicate packet: ignore payload, but ACK the last in-order seq
+                    if expected > 0:
+                        send_ack = True
+                        ack_seq = expected - 1
+
+                else:
+                    # TODO: Out-of-order packets should be stored in a buffer and send ack later when the expected packet is received.
+                    # Out-of-order (> expected): drop payload
+                    # Only send ACK if we've at least received one in-order packet
+                    if expected > 0:
+                        send_ack = True
+                        ack_seq = expected - 1
+
+            # Send cumulative ACK for this msg_id outside the lock,
+            # but only if we actually have a valid ACK to send.
+            if send_ack:
+                ack_packet = _build_packet(FLAG_ACK, msg_id, ack_seq, total, b"")
+                self.socket.sendto(ack_packet, addr)
+
+    # ---------- Sender / Retransmission Thread ----------
+
+    def _sender_loop(self) -> None:
+        """Global Go-Back-N retransmission loop across all messages."""
+        while True:
+            with self._cv:
+                if self._closed:
+                    return
+
+                # Wait until we have at least one outstanding packet
+                while not self._outstanding and not self._closed:
+                    self._cv.wait()
+
+                if self._closed:
+                    return
+
+                base_key = self._base_key
+                base_time = self._last_base_change_time
+
+            # Single timer for the current base
+            time.sleep(ACK_TIMEOUT)
+
+            with self._cv:
+                if self._closed:
+                    return
+
+                # No outstanding means nothing to retransmit
+                if not self._outstanding or self._base_key is None:
                     continue
 
-                # Store chunk if new
-                if seq not in st["chunks"]:
-                    st["chunks"][seq] = payload
+                # If base changed (or base_time changed), the timer was restarted.
+                if self._base_key != base_key or self._last_base_change_time != base_time:
+                    continue
 
-                # If we now have a full message, assemble and mark complete
-                if len(st["chunks"]) == st["total"]:
-                    assembled = b"".join(st["chunks"][i] for i in range(st["total"]))
-                    self._complete[msg_id] = assembled
-                    del self._inflight[msg_id]
+                # At this point:
+                #  - base_key is still the same as when we started waiting
+                #  - no new ACK has advanced the base
+                #  => timeout for current base: Go-Back-N retransmission
 
-                    # Wake recv() in case it’s waiting for this (or future) msg
-                    self._cv.notify_all()
+                # By invariant, base is at index 0 of _resend_queue (if any).
+                # Just retransmit from the front forward.
+                for key in self._resend_queue:
+                    if key in self._outstanding:
+                        packet = self._outstanding[key]
+                        self.socket.sendto(packet, (self.dst_ip, self.dst_port))
+                # Timer will be restarted when/if base advances due to ACKs
 
-            # Send ACK for this specific (msg_id, seq) outside the lock.
-            ack_packet = _build_packet(FLAG_ACK, msg_id, seq, total, b"")
-            self.socket.sendto(ack_packet, addr)
+    # ---------- Public API ----------
 
     def send(self, data_bytes: bytes) -> None:
-        """Note that data_bytes can be larger than one packet."""
+        """Enqueue data for sending using global Go-Back-N (finite window).
+
+        - Packets from all send() calls share a global send window.
+        - At most WINDOW_SIZE unacked DATA packets can be in flight.
+        - If the window is full, send() blocks until space is freed by ACKs.
+        - Retransmission and timeout logic is handled by _sender_loop.
+        """
         msg_id = self._next_msg_id & 0xFFFF
         self._next_msg_id = (self._next_msg_id + 1) & 0xFFFF
 
@@ -179,49 +342,40 @@ class Streamer:
             # Nothing to send
             return
 
-        # Build all packets so we can retransmit them on timeout
         packets = []
         for seq in range(total):
             start = seq * MAX_DATA_SIZE
             chunk = data_bytes[start:start + MAX_DATA_SIZE]
-
-            # Build packet with MD5 checksum and size safety
             packet = _build_packet(FLAG_DATA, msg_id, seq, total, chunk)
             packets.append(packet)
-            self.socket.sendto(packet, (self.dst_ip, self.dst_port))
 
-        pending_seqs = set(range(total))
+        with self._cv:
+            if self._closed:
+                raise RuntimeError("Streamer is closed")
 
-        # Retransmit only packets whose (msg_id, seq) haven't been ACKed
-        while pending_seqs:
-            with self._cv:
-                if self._closed:
-                    raise RuntimeError("Streamer is closed")
+            # Initialize per-message pending seqs
+            pending = set(range(total))
+            self._pending_by_msg[msg_id] = pending
 
-                # Remove any sequences that have been ACKed
-                newly_acked = {
-                    seq for seq in pending_seqs
-                    if (msg_id, seq) in self._acked_packets
-                }
-                for seq in newly_acked:
-                    pending_seqs.remove(seq)
-                    self._acked_packets.remove((msg_id, seq))
-
-                if not pending_seqs:
-                    # All packets for this message were ACKed
-                    return
-
-                # Wait up to ACK_TIMEOUT for more ACKs
-                self._cv.wait(timeout=ACK_TIMEOUT)
+            # Add packets to global outstanding window and send them,
+            # respecting WINDOW_SIZE
+            for seq, packet in enumerate(packets):
+                # If window is full, wait for ACKs to free space
+                while len(self._outstanding) >= WINDOW_SIZE and not self._closed:
+                    self._cv.wait()
 
                 if self._closed:
                     raise RuntimeError("Streamer is closed")
 
-                # Loop; on timeout we fall through and retransmit remaining
+                key = (msg_id, seq)
+                if key not in self._outstanding:
+                    self._resend_queue.append(key)
+                self._outstanding[key] = packet
+                self.socket.sendto(packet, (self.dst_ip, self.dst_port))
 
-            # Timeout or spurious wakeup: retransmit only unacked packets
-            for seq in pending_seqs:
-                self.socket.sendto(packets[seq], (self.dst_ip, self.dst_port))
+            # After adding new packets, recompute base and wake sender loop
+            self._recompute_base_locked()
+            self._cv.notify_all()
 
     def recv(self) -> bytes:
         with self._cv:
@@ -229,8 +383,8 @@ class Streamer:
                 if self._closed:
                     raise RuntimeError("Streamer is closed")
 
-                if self._expected_msg_id in self._complete:
-                    data = self._complete.pop(self._expected_msg_id)
+                if self._expected_msg_id in self._complete_msg:
+                    data = self._complete_msg.pop(self._expected_msg_id)
                     self._expected_msg_id = (self._expected_msg_id + 1) & 0xFFFF
                     return data
 
@@ -240,17 +394,21 @@ class Streamer:
         """Cleans up using a FIN/ACK-style teardown.
 
         Steps:
-        1. (Stop-and-wait send() already ensures last data was ACKed.)
+        1. Wait until all outstanding DATA packets are ACKed.
         2. Send a FIN packet.
         3. Wait for an ACK of the FIN (retransmit on timeout).
         4. Wait until a FIN packet has been received from the other side.
         5. Wait 2 seconds.
-        6. Stop the listener and return.
+        6. Stop the listener/sender and return.
         """
         with self._cv:
             if self._closed:
                 # Already closed; make close() idempotent
                 return
+
+            # Step 1: wait until all data packets are ACKed
+            while (self._outstanding or self._pending_by_msg) and not self._closed:
+                self._cv.wait(timeout=ACK_TIMEOUT)
 
         # Allocate a msg_id for the FIN
         fin_msg_id = self._next_msg_id & 0xFFFF
@@ -267,15 +425,13 @@ class Streamer:
                 if self._closed:
                     break
 
-                # FIN is considered ACKed when (fin_msg_id, 0) is ACKed
-                if (fin_msg_id, 0) in self._acked_packets:
-                    self._acked_packets.remove((fin_msg_id, 0))
+                # FIN is considered ACKed when self._fin_acks_received is True
+                if self._fin_acks_received:
                     break
 
                 self._cv.wait(timeout=ACK_TIMEOUT)
 
-                if (fin_msg_id, 0) in self._acked_packets:
-                    self._acked_packets.remove((fin_msg_id, 0))
+                if self._fin_acks_received:
                     break
 
                 if self._closed:
@@ -297,9 +453,14 @@ class Streamer:
             self._closed = True
             self._cv.notify_all()
 
-        # Wait for listener to exit and clean up executor
+        # Wait for listener & sender loops to exit and clean up executor
         try:
             self._listener_future.result(timeout=2)
+        except Exception:
+            pass
+
+        try:
+            self._sender_future.result(timeout=2)
         except Exception:
             pass
 
