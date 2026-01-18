@@ -128,34 +128,35 @@ class Streamer:
             if packet == b"":
                 return
 
-            try:
-                if len(packet) < HEADER_SIZE + HASH_SIZE:
-                    # Corrupted/truncated packet, drop
-                    continue
+            if len(packet) < HEADER_SIZE + HASH_SIZE:
+                # Corrupted/truncated packet, drop
+                print("Corrupted/truncated packet, dropping")
+                continue
 
+            try:
                 # Parse header
                 flag, msg_id, seq, total = struct.unpack(
                     HEADER_FMT, packet[:HEADER_SIZE]
                 )
-
-                # Extract digest and payload
-                digest = packet[HEADER_SIZE:HEADER_SIZE + HASH_SIZE]
-                payload = packet[HEADER_SIZE + HASH_SIZE:]
-
-                # Verify MD5(header + payload)
-                header = packet[:HEADER_SIZE]
-                expected_digest = hashlib.md5(header + payload).digest()
-                if digest != expected_digest:
-                    continue
-
-                # Safety: ensure payload isn't larger than we expect
-                if len(payload) > MAX_DATA_SIZE:
-                    continue
-
             except Exception as e:
-                # Any parsing/hash errors => drop packet, keep listener alive
-                print("listener died!")
+                print("Error unpacking header")
                 print(e)
+                continue
+
+            # Extract digest and payload
+            digest = packet[HEADER_SIZE:HEADER_SIZE + HASH_SIZE]
+            payload = packet[HEADER_SIZE + HASH_SIZE:]
+
+            # Verify MD5(header + payload)
+            header = packet[:HEADER_SIZE]
+            expected_digest = hashlib.md5(header + payload).digest()
+            if digest != expected_digest:
+                print("Corrupted packet, dropping")
+                continue
+
+            # Safety: ensure payload isn't larger than we expect
+            if len(payload) > MAX_DATA_SIZE:
+                print("Payload larger than MAX_DATA_SIZE, dropping")
                 continue
 
             # ---------- ACK packets ----------
@@ -215,6 +216,7 @@ class Streamer:
                 else:
                     if st["total"] != total:
                         # Inconsistent header, drop
+                        print("Inconsistent header, dropping")
                         continue
 
                 expected = st["expected"]
