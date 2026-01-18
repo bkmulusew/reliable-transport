@@ -43,6 +43,7 @@ def _build_packet(flag: int, msg_id: int, seq: int, total: int, payload: bytes) 
         raise ValueError("Packet larger than MAX_UDP_PAYLOAD")
 
     return packet
+
 class Streamer:
     def __init__(self, dst_ip, dst_port,
                  src_ip=INADDR_ANY, src_port=0):
