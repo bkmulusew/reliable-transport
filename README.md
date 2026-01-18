@@ -101,6 +101,11 @@ python3 test.py 8000 8001 2
 
 The program sends sequences of numbers between the two processes and verifies correctness.
 
+## Credits
+
+The original project skeleton and assignment design were created by **[Steve Tarzia](https://stevetarzia.com)**.
+This implementation builds on his provided framework and simulator.
+
 ## Summary
 
 This project demonstrates how core transport-layer ideas (chunking, sequencing, acknowledgements, retransmissions, and connection teardown) can be built on top of an unreliable network. It is intentionally simpler than TCP, but captures the essential mechanics of reliable streaming communication.
